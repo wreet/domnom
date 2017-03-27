@@ -1,0 +1,517 @@
+<!--
+  ******************************************************************************
+  * domnom.js browser fuzzer by @chaseahiggins, loudeating23
+  ******************************************************************************
+  * domnom is a simple javascript fuzzer that tries to find bugs by choosing
+  * parent/child combinations of various depths using several different
+  * techniques to reference the children. the goal is to find invalid access
+  * issues, uafs, null ptr deref etc
+  * inspired by lcamtuf's ref_fuzz, with some sauces for new ES6 stuff
+    * https://lcamtuf.blogspot.com/2010/06/announcing-reffuzz-2yo-fuzzer.html
+  ******************************************************************************
+  * BUGS/TODO:
+		* maybe move logging to webworker to keep main thread free to fuzz
+		* 'arg builder' that builds random functions objs etc in a semi-intelligent
+			* way that is likely to cause problems (mostly with arraybuff resizing)
+		* NaNs and nulls getting through number while for arr len edit
+		* violation of cors causes script to stop if accessed locally via file://
+		* newEl() should be able to choose random test_area children as parents too
+		* maybe move all fun vals to an iterable obj
+		* ie11 needs work, should probably keep it supported(maybe url mode opt?)
+		* childnodes count growing too quickly
+		* childnodes unreliable, keep el count ref somewhere, inc on newEl, dec on
+			* removel
+  ******************************************************************************
+-->
+<html>
+  <head>
+    <title>domnom.js by @chaseahiggins</title>
+    <link href="https://fonts.googleapis.com/css?family=Space+Mono:400,700" rel="stylesheet">
+    <style>
+			* {
+				margin: 0;
+				padding: 0;
+			}
+
+      html, body {
+        font-family: 'Space Mono', monospace;
+        font-size: 18px;
+        background-color: #222;
+        color: #ddd;
+      }
+
+      #fuzzing {
+        margin: 0 1em;
+      }
+
+      a, a.link, a.visited {
+        color: red;
+        text-decoration: none;
+      }
+
+      #log {
+        margin: 0.5em 0 1em 0;
+      }
+
+      #log div {
+        border: 1px solid #111;
+        background-color: #333;
+        height: 40%;
+        width: 50%;
+        padding: 5px;
+        font-size: 14px;
+				overflow-y: scroll;
+      }
+
+			#log::-webkit-scrollbar-track {
+				-webkit-box-shadow: inset 0 0 6px rgba(0,0,0,0.3);
+			}
+
+			#log::-webkit-scrollbar-thumb {
+				background-color: darkgrey;
+				outline: 1px solid slategrey;
+			}
+
+      #test_area {
+        border: 1px solid #111;
+        background-color: #333;
+        height: 33%;
+        width: 33%;
+        font-size: 14px;
+      }
+    </style>
+		<!--[if IE]>
+		<style>
+			#log div {
+				height: 500px;
+			}
+		</style>
+		<![endif]-->
+    <script>
+      var domnom = domnom || {};
+
+      // options
+      domnom.opts = {
+				odds: 5, // how random should we be
+				max_log: 16384, // 16k
+				max_els: 10, // can get out of hand quickly
+				func_argc: 7, // max number of args for func calls
+				max_bad_els: 10, // max num of bad accesses to tolerate
+				max_depth: 10, // max trips into objects when reading
+        max_type_misses: 10 // max misses on type preservation
+			};
+
+      // runtime values
+      domnom.run = {};
+
+      // elements, properties, attributes etc
+      // fun values for things
+      domnom.fun_vals = [
+        Infinity,
+        -Infinity,
+        undefined,
+        null,
+        false,
+        true,
+        eval,
+        -1,
+        navigator,
+        new Array,
+        0.1333333333333337,
+        0x13371337,
+        7e7,
+        -7e7,
+        7e-7,
+        1e101,
+        -1e101,
+        "aqua"
+      ];
+
+      // functions that have a history of being problematic, mostly new stuff from es6
+      // these functions come from bug reports on p0, and other disclosed browser errs
+      domnom.fun_objs = [
+        Object,
+        JSON,
+        Array,
+        DataView,
+        ArrayBuffer,
+        Uint8ClampedArray
+      ];
+
+      // html
+      domnom.html = {};
+      domnom.html.tags = [
+        "div", "p", "img", "object", "video",
+				"audio", "br", "canvas", "svg", "link",
+				"span", "figcaption", "time", "meta", "embed",
+				"textarea", "iframe", "nav", "area", "fieldset",
+				"applet", "html", "a", "bdi", "keygen",
+				"noframes", "progress", "sup", "table", "wbr",
+				"cron", "marquee", "aside"
+      ];
+
+      domnom.html.attributes =[
+        "tabindex"
+        //"aria-*"
+      ];
+
+      // css
+      domnom.css = {};
+      domnom.css.properties = [
+        "border-top"
+      ];
+
+      // js
+      domnom.js = {};
+      domnom.js.bad_props = {
+        // avoid these to prevent mangling the dom, from lcamtuf's ref_fuzz
+        "parentNode" : 1,
+        "nextSibling" : 1,
+        "previousSibling" : 1,
+        "top" : 1,
+        "parent" : 1,
+        "opener" : 1,
+        "ownerDocument" : 1,
+        "parentElement" : 1,
+        "parentTextEdit" : 1,
+        "offsetParent" : 1,
+        "DOCUMENT_POSITION_PRECEDING" : 1,
+        "document" : 1,
+        "activeElement" : 1,
+        "documentElement" : 1,
+        "onbeforeunload" : 1
+      };
+
+      // the things
+      domnom.util = {};
+      domnom.util.heapSpray = function() {
+        // at start of tests, after every round, and whenever you're just feeling like it
+        // this is essentially from lcamtuf's ref_fuzz
+        // we'll start with 32MB(22) spray given how much memory most machines now have
+        // instead of the 16MB(21) spray used in ref_fuzz
+        var spray_str = "ABCDABCD";
+        for (var i = 0; i < 22; i++) // you end up spraying spray_str.length * (2 ^ loop_count) bytes
+          spray_str += spray_str;
+        return 1;
+      };
+
+      domnom.util.log = function(msg) {
+				setTimeout(function() { // keep this channel clear
+					if (domnom.run.log.innerHTML.length > domnom.opts.max_log) // big one...
+						domnom.run.log.innerHTML = domnom.run.log.innerHTML.slice(domnom.run.log.innerHTML.length - domnom.opts.max_log);
+					domnom.run.log.innerHTML += msg + "<br />";
+					domnom.run.log.scrollTop = domnom.run.log.scrollHeight; // scroll on add
+				}, 0);
+      }; // end domnom.util.log()
+
+      domnom.util.rand = function(mod) {
+        return Math.floor(Math.random() * mod);
+      }; // end rand()
+
+      domnom.util.addRef = function(obj, origin) {
+        // we need to store refs if we're ever going to confusulate them
+        // potentially, we make a decision here as to whether it's worth our time to store it
+        // let's add the reference
+        //domnom.util.log("storing ref: " + obj + "; origin: " + origin + "; round: " + domnom.run.round + "; ref#: " + domnom.run.ref_stack.length);
+        // parsh it
+        domnom.run.ref_stack.push(obj);
+      }; // end addref()
+
+      domnom.util.readObj = function(obj, prop) {
+        // see if we can read this object
+        prop = prop || 0;
+        var val;
+        try {
+          if (prop) {
+            val = obj[prop];
+            //domnom.util.log(prop + ": " + val + "; type: " + typeof(val));
+          } else {
+            val = obj;
+          }
+        } catch(e) {
+          return false;
+        }
+        return {
+          val: val,
+          type: typeof(val)
+        }
+      }; // end readObj()
+
+      domnom.util.setObj = function(obj, prop, type) {
+        // set the property of this object
+        // this is where the magic happens basically, where we
+        // try and pick the craziest shit possible to ref
+        var val;
+        switch (domnom.util.rand(3)) {
+          case 0: // do a fun_val
+            val = domnom.fun_vals[domnom.util.rand(domnom.fun_vals.length)];
+            break;
+
+          case 1: // pick from the ref stack
+            val = domnom.run.ref_stack[domnom.util.rand(domnom.run.ref_stack.length)];
+            break;
+
+          case 2: // pick random property from a fun_objs
+            val = domnom.fun_objs[domnom.util.rand(domnom.fun_objs.length)];
+            var props = Object.getOwnPropertyNames(val);
+            val = val[props[domnom.util.rand(props.length)]];
+            break;
+
+          case 3: // we just found a new home for a function
+
+            break;
+        } // end switch
+        if (type && typeof(val) !== type && domnom.run.type_misses < domnom.opts.max_type_misses) {
+          domnom.run.type_misses++;
+          return domnom.util.setObj(obj, prop, type); // try again, yeah it's lazy
+        } else if (type && typeof(val) === type) domnom.run.type_misses = 0; // reset it
+        try {
+					obj[prop] = val;
+				} catch(e) {
+					//domnom.util.log("could not change property: " + prop);
+				}
+      }; // end setObj()
+
+      domnom.util.walkObj = function(obj, origin) {
+        // let's review this object's properties and potentially store refs
+        var prop;
+        for (prop in obj) {
+          var val;
+          val = domnom.util.readObj(obj, prop);
+          if (!val) continue; // skip a bad prop
+          val = val.val; // maybe we'll make the obj not redundant at somme point
+          // store a ref maybe, we'll have a few cases where no
+          if (typeof(val) === "string" && domnom.util.rand(domnom.opts.odds) !== 0)
+          	continue; // strangs can be so boring, advice from ref_fuzz
+          // maybe case it to *sometimes* allow a fuction ref
+          if (val != null && typeof(val) != "function" && domnom.js.bad_props[prop] != 1)
+            domnom.util.addRef(val, origin + '.' + prop);
+        } // finished with props
+      }; // end walkObj()
+
+      domnom.util.callFunctions = function(obj, origin) {
+        // try and walk a potentially freed obj and call functions
+        var prop;
+        var rets = [];
+        for (prop in obj) {
+          var val;
+          val = domnom.util.readObj(obj, prop);
+          if (!val) continue; // skip a bad prop
+          val = val.val;
+          // see if we should keep looking at this one
+          if (typeof(val) != "function") continue;
+          // see if we can call it
+          try {
+            // build a dummy param list
+            // js gives us flexibility to do too many args
+						// do a dumb arg builder for now
+						var argc = domnom.util.rand(domnom.opts.func_argc);
+						var args = [];
+						for (var i = 0; i < argc; i++)
+							args.push(domnom.run.ref_stack[domnom.util.rand(domnom.run.ref_stack.length)]);
+						// call it
+						var ret = val.apply(obj, args);
+						//domnom.util.log(prop + " function returned: " + ret);
+						// let's pop it in the rets stack
+            /*
+						if (domnom.util.rand(domnom.opts.odds) % 2 == 0 && typeof(ret) == "object") {
+							// maybe change odds later, remove mod. might also allow other types in
+							domnom.util.addRef(ret, "funcreturn");
+						}
+            */
+            rets.push(ret);
+          } catch(e) {
+            //domnom.util.log("couldn't call " + prop + ": " + e);
+          }
+          // if we get a valid return val, save that ref
+        }
+        return rets;
+      }; // end callFunctions()
+
+			domnom.util.objThrasher = function(obj, origin) {
+				// let's go through and fuckulate some stuff
+				// again we step through props
+				var prop;
+				for (prop in obj) {
+					// first, we know we can skip the blacklist props
+					// also skip a null prop etc, or just randomly
+					if (!prop || domnom.js.bad_props[prop] == 1) continue; // could be combined
+					if (domnom.util.rand(domnom.opts.odds) === 0) continue; // were already long
+          if (prop == "length" || Array.isArray(obj[prop])) { // we specifically want to try and mess with this one
+            var fval;
+            do {
+              fval = domnom.fun_vals[domnom.util.rand(domnom.fun_vals.length)];
+            }
+            while (isNaN(fval));
+            if (Math.abs(fval) > 0x10000) fval %= domnom.util.rand(0x10000); // was causing too many large allocs
+            try {
+              (prop == "length") ? obj[prop] = fval : obj[prop].length = fval;
+            } catch (e) {
+              console.log("can't set len: " + fval);
+              console.log(e);
+            }
+            continue;
+          }
+					var val;
+          val = domnom.util.readObj(obj, prop);
+          if (!val) continue; // skip a bad prop
+          val = val.val;
+					// decide if we want to delete the prop or change it
+					if (domnom.util.rand(domnom.opts.odds) === 0) {
+						// 1/odds chance, and we hit it. delete the prop
+						try {
+							//domnom.util.log("deleting propery: " + prop);
+							delete obj[prop];
+						} catch (e) {
+							//domnom.util.log("could not delete property: " + prop);
+						}
+					}
+					else {
+						// let's just change it to something fun
+						//domnom.util.log("changing property: " + prop);
+            if (domnom.util.rand(domnom.opts.odds) % 2 == 0) // preserve prop type
+              domnom.util.setObj(obj, prop, typeof(obj[prop]));
+            else
+              domnom.util.setObj(obj, prop, null); // just let it go crazy
+					}
+				} // end prop walk
+			}; // end objThrasher()
+
+      domnom.util.newElement = function() {
+        // add a new element to testing tree
+        try {
+          // picks  a random el from the list of allowed tags at domnom.html.tags
+          var tag = document.createElement(domnom.html.tags[domnom.util.rand(domnom.html.tags.length)]);
+          // pop it into the missile range
+          if (domnom.util.rand(domnom.opts.odds) == 0) { // pick a rand child as parent
+          	var r = domnom.util.rand(domnom.opts.max_els);
+          	console.log('opting to attach to random child: ' + r);
+          	domnom.run.test_area.childNodes[r].appendChild(tag);
+    			}
+          else // just add to root
+          	domnom.run.test_area.appendChild(tag);
+          // add to the current list of target tags
+          //domnom.run.curr_tags.push(tag);
+          // make it have stuff
+          tag.innerHTML = "One count of being a bear.<br />And one count of being an accessory to being a bear.";
+          tag.value = "stonecutters";
+        } catch(e) {
+          // we had a problem
+          console.log("couldn't create a new tag: " + e);
+          domnom.util.log("couldn't create a new tag: " + e);
+          return false;
+        }
+        // return the new tag for if caller wants to verify what was added
+        return tag;
+      }; // end newElement()
+
+      domnom.util.reload = function() {
+     		//alert("reloading!"); // block to pause reload
+      	location.reload(true);
+      }; // end reload()
+
+      // the testing
+      domnom.init = function() {
+        // setup
+        domnom.run.log = document.getElementById("log").getElementsByTagName("div")[0]; // log div, but why?
+        domnom.run.log.innerHTML = "";
+        domnom.util.log("domnom.js - loudeating");
+        domnom.util.log("initializing fuzzer...");
+        domnom.run.test_area = document.getElementById("test_area"); // tests div
+        domnom.run.test_area.innerHTML = "";
+        domnom.run.ref_stack = []; // a place for references™
+        domnom.run.round = 0; // round count for our references
+        domnom.run.bad_els = 0; // count of unremovable dom els
+        domnom.run.type_misses = 0; // maximum number of times to retry type perservation
+        // fill the heap up a little
+        domnom.util.heapSpray();
+        // let's go
+        domnom.util.log("let's get started :)");
+        domnom.next();
+      }; // end domnom.init()
+
+      domnom.next = function() {
+        // time do do something
+        // depending on our fuzzing state, we might want to add, test or destroy refs
+        // we might also try various other strategies to fuckulate the dom
+        domnom.run.curr_tags = domnom.run.test_area.childNodes.length;
+				if ((domnom.util.rand(domnom.opts.odds) === 0 && domnom.run.curr_tags < domnom.opts.max_els) || domnom.run.ref_stack.length === 0) { // add one
+					var el = domnom.util.newElement(); // easy to add, VERY expensive to work with
+					// store refs
+					domnom.util.walkObj(el, "origin");
+				}
+				// choose an element in the list to mess with
+				if (domnom.run.curr_tags > 0) {
+					var r = domnom.util.rand(domnom.run.curr_tags);
+					var el = domnom.run.test_area.childNodes[r];
+					domnom.util.objThrasher(el, "something");
+				}
+				// call some funcs, it's a farty afterall
+				if (domnom.run.curr_tags > 0) {
+          var new_refs = [];
+					var r = domnom.util.rand(domnom.run.curr_tags);
+					var el = domnom.run.test_area.childNodes[r];
+					//domnom.util.callFunctions(el, "somewhere");
+          for (var i = 0; i < domnom.opts.max_depth; i++) {
+            var rets = domnom.util.callFunctions(el, "somewhere");
+            rets.map(function(ret) {
+              if (ret) new_refs.push(ret);
+            });
+          }
+          domnom.run.ref_stack = domnom.run.ref_stack.concat(new_refs);
+				}
+				// while we're calling funcs, let's pick some from the refs stack too
+
+
+				// maybe delete one I do what I want
+				if (domnom.util.rand(domnom.opts.odds) === 0) {
+					// delete's job is also to check if too many bad els exist
+					if (domnom.run.bad_els > domnom.opts.max_bad_els)
+						domnom.util.reload();
+					try {
+						var r = domnom.util.rand(domnom.run.curr_tags);
+						// peel off the dom
+						domnom.run.test_area.removeChild(domnom.run.test_area.childNodes[r]);
+						delete domnom.run.test_area.childNodes[r];
+					} catch (e) {
+						domnom.run.bad_els++;
+						domnom.util.log("could not remove element: " + e);
+					}
+				}
+				// let's get ready for the next round
+				//if (domnom.run.round > 50) return;
+				// inc round count
+				//console.log("end round: " + domnom.run.round);
+				domnom.run.round++;
+				domnom.util.heapSpray();
+				// here goes nothing..
+				//domnom.next();
+				setTimeout(function() {
+					domnom.next();
+				}, 0);
+			}; // end domnom.next()
+    </script>
+  </head>
+  <body onload="domnom.init();">
+    <div id="fuzzing">
+      <span style="border-bottom: 1px solid red;">
+        <span style="font-size: 2em;">domnom.js</span> by <a href="https://twitter.com/chaseahiggins">@chaseahiggins</a>
+      </span>
+      <div id="log">
+        log:<br />
+        <div>
+          &nbsp;
+        </div>
+      </div>
+      <!-- test area -->
+      missile range:
+      <div id="test_area">
+        &nbsp;
+      </div>
+    </div>
+  </body>
+</html>
+
+
+
+
